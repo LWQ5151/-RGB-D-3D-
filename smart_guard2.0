@@ -1,0 +1,674 @@
+
+import os
+import sys
+import time
+import threading
+from collections import deque
+from pathlib import Path
+
+# 自动定位 PyQt5 的 Qt 平台插件目录，避免 "could not find Qt platform plugin" 报错
+if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
+    _candidates = [
+        Path(sys.prefix) / "Lib" / "site-packages" / "PyQt5" / "Qt5" / "plugins",
+        Path(sys.prefix) / "Library" / "plugins",
+    ]
+    for _p in _candidates:
+        if (_p / "platforms").is_dir():
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(_p)
+            break
+
+import cv2
+import numpy as np
+
+# ⚠️ 注意导入顺序: pyorbbecsdk 和 ultralytics(torch) 必须先于 PyQt5。
+# 否则 torch 的 c10.dll 可能会与 Qt 的动态库产生冲突导致崩溃。
+try:
+    import pyorbbecsdk as ob
+    OB_ERROR = None
+except Exception as _e:
+    ob = None
+    OB_ERROR = _e
+
+try:
+    from ultralytics import YOLO
+    YOLO_ERROR = None
+except Exception as _e:
+    YOLO = None
+    YOLO_ERROR = _e
+
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap, QColor
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QHBoxLayout,
+    QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QTextEdit,
+    QGroupBox, QSpinBox, QDoubleSpinBox, QSplitter, QHeaderView, QMessageBox,
+)
+
+# ==============================================================================
+# 1. 全局参数与常量定义
+# ==============================================================================
+# COCO 17 个骨骼关键点的索引
+K_NOSE, K_LEYE, K_REYE, K_LEAR, K_REAR = 0, 1, 2, 3, 4
+K_LSHO, K_RSHO, K_LELB, K_RELB, K_LWRI, K_RWRI = 5, 6, 7, 8, 9, 10
+K_LHIP, K_RHIP, K_LKNE, K_RKNE, K_LANK, K_RANK = 11, 12, 13, 14, 15, 16
+
+# 骨骼连线（用于画面渲染）
+SKELETON = [
+    (K_LSHO, K_RSHO), (K_LSHO, K_LELB), (K_LELB, K_LWRI),
+    (K_RSHO, K_RELB), (K_RELB, K_RWRI),
+    (K_LSHO, K_LHIP), (K_RSHO, K_RHIP), (K_LHIP, K_RHIP),
+    (K_LHIP, K_LKNE), (K_LKNE, K_LANK),
+    (K_RHIP, K_RKNE), (K_RKNE, K_RANK),
+    (K_NOSE, K_LEYE), (K_NOSE, K_REYE),
+]
+
+DIST_HISTORY = 8          # 距离滑动平均窗口大小
+FALL_CONFIRM = 4          # 连续 N 帧满足跌倒条件后确认
+FALL_CLEAR = 8            # 连续 N 帧站立后解除跌倒
+TRACK_MAX_LOST = 15       # 目标丢失多少帧后删除轨迹
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# UI 颜色配置
+COLOR_ALARM = "#d32f2f"   # 红色报警
+COLOR_SAFE = "#1e7d32"    # 绿色安全
+COLOR_WARN = "#f57c00"    # 橙色警告
+
+
+# ==============================================================================
+# 2. 追踪与算法模块
+# ==============================================================================
+def angle_deg(a, b):
+    """计算向量 ab 与竖直方向的锐角偏差 (0度=竖直, 90度=水平)"""
+    v = np.array([b[0] - a[0], b[1] - a[1]], dtype=np.float32)
+    norm = float(np.linalg.norm(v))
+    if norm < 1e-3:
+        return 0.0
+    return float(np.degrees(np.arctan2(abs(v[0]), abs(v[1]))))
+
+
+class KalmanBox:
+    """一维卡尔曼滤波器，用于平滑目标的中心点坐标"""
+    def __init__(self, box):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        x1, y1, x2, y2 = box
+        self.kf.statePost = np.array([[(x1 + x2) / 2], [(y1 + y2) / 2], [0], [0]], np.float32)
+
+    def predict(self):
+        p = self.kf.predict()
+        return float(p[0]), float(p[1])
+
+    def update(self, box):
+        x1, y1, x2, y2 = box
+        self.kf.correct(np.array([[(x1 + x2) / 2], [(y1 + y2) / 2]], np.float32))
+
+
+class PersonTrack:
+    """记录单个目标（人）的所有状态"""
+    __slots__ = ("track_id", "box", "centroid", "kf", "dist_history", "smooth_dist",
+                 "lost", "fall_count", "stand_count", "fallen", "fall_score",
+                 "last_seen", "keypoints", "conf", "age")
+
+    def __init__(self, track_id, box, conf, keypoints=None):
+        self.track_id = track_id
+        self.box = box
+        self.centroid = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        self.kf = KalmanBox(box)
+        self.dist_history = deque(maxlen=DIST_HISTORY)
+        self.smooth_dist = None
+        self.lost = 0
+        self.fall_count = 0
+        self.stand_count = 0
+        self.fallen = False
+        self.fall_score = 0.0
+        self.last_seen = time.time()
+        self.keypoints = keypoints
+        self.conf = conf
+        self.age = 0
+
+    def center(self):
+        return self.kf.predict()
+
+
+def iou(a, b):
+    """计算两个框的交并比 (IoU)"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+class MultiObjectTracker:
+    """轻量级多目标跟踪器（基于 IoU + 中心点距离）"""
+    def __init__(self, max_lost=TRACK_MAX_LOST, iou_thresh=0.25):
+        self.tracks = {}
+        self.next_id = 0
+        self.max_lost = max_lost
+        self.iou_thresh = iou_thresh
+
+    def update(self, detections):
+        predicted = {tid: trk.center() for tid, trk in self.tracks.items()}
+        candidates = []
+        
+        # 1. 匹配预测框与新检测框（按得分贪心匹配）
+        for tid, trk in self.tracks.items():
+            for j, (box, _c, _k) in enumerate(detections):
+                ov = iou(trk.box, box)
+                if ov < self.iou_thresh:
+                    continue
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                d = float(np.hypot(cx - predicted[tid][0], cy - predicted[tid][1]))
+                if d > 120.0:
+                    continue
+                score = ov * 2.0 - d / 120.0
+                candidates.append((score, tid, j))
+                
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        used_track, used_det = set(), set()
+        for _, tid, j in candidates:
+            if tid in used_track or j in used_det:
+                continue
+            self._assign(tid, detections[j])
+            used_track.add(tid)
+            used_det.add(j)
+
+        # 2. 未匹配的创建新轨迹
+        for j, (box, conf, kps) in enumerate(detections):
+            if j not in used_det:
+                self.tracks[self.next_id] = PersonTrack(self.next_id, box, conf, kps)
+                self.next_id += 1
+
+        # 3. 清理丢失过久的轨迹
+        for tid in list(self.tracks.keys()):
+            if self.tracks[tid].lost >= self.max_lost:
+                del self.tracks[tid]
+
+        return dict(self.tracks)
+
+    def _assign(self, tid, det):
+        box, conf, kps = det
+        trk = self.tracks[tid]
+        trk.box = box
+        trk.centroid = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        trk.kf.update(box)
+        trk.keypoints = kps
+        trk.conf = conf
+        trk.lost = 0
+        trk.last_seen = time.time()
+        trk.age += 1
+
+    def mark_lost(self):
+        for trk in self.tracks.values():
+            trk.lost += 1
+
+
+class FallDetector:
+    """
+    跌倒检测器：结合骨骼点计算得分
+    得分 = 0.55 * 躯干倾斜分 + 0.25 * 宽高比分 + 0.20 * 髋部落地分
+    """
+    def __init__(self, threshold=0.6, confirm=FALL_CONFIRM, clear=FALL_CLEAR):
+        self.threshold = threshold
+        self.confirm = confirm
+        self.clear = clear
+
+    def _torso_angle(self, kps):
+        lsho, rsho, lhip, rhip = kps[K_LSHO], kps[K_RSHO], kps[K_LHIP], kps[K_RHIP]
+        if min(lsho[2], rsho[2], lhip[2], rhip[2]) < 0.3:
+            return None
+        shou = ((lsho[0] + rsho[0]) / 2, (lsho[1] + rsho[1]) / 2)
+        hip = ((lhip[0] + rhip[0]) / 2, (lhip[1] + rhip[1]) / 2)
+        return angle_deg(hip, shou)
+
+    def score(self, box, kps):
+        if kps is None: return 0.0
+        
+        # 1. 躯干倾斜角（站立约0度，跌倒接近90度）
+        angle = self._torso_angle(kps)
+        angle_score = float(np.clip((angle - 30.0) / 60.0, 0.0, 1.0)) if angle is not None else 0.0
+        
+        # 2. 宽高比（站立时高>宽，躺倒时宽>高）
+        w, h = box[2] - box[0], box[3] - box[1]
+        ar = h / w if w > 1 else 1.0
+        ar_score = float(np.clip((1.0 - ar) / 0.6, 0.0, 1.0)) if ar < 1.0 else 0.0
+        
+        # 3. 髋部离地距离（站立时髋部在中间，跌倒时贴地）
+        lhip, rhip = kps[K_LHIP], kps[K_RHIP]
+        hip_ground = None
+        if min(lhip[2], rhip[2]) >= 0.3:
+            hip_y = (lhip[1] + rhip[1]) / 2
+            h_box = max(1.0, box[3] - box[1])
+            hip_ground = float(np.clip((box[3] - hip_y) / h_box, 0.0, 1.0))
+        hip_score = float(np.clip((0.5 - hip_ground) / 0.45, 0.0, 1.0)) if hip_ground is not None else 0.0
+
+        return 0.55 * angle_score + 0.25 * ar_score + 0.20 * hip_score
+
+    def update(self, trk, box, kps):
+        s = self.score(box, kps)
+        trk.fall_score = s
+        changed = False
+        if s >= self.threshold:
+            trk.stand_count = 0
+            trk.fall_count += 1
+            if trk.fall_count >= self.confirm and not trk.fallen:
+                trk.fallen = True
+                changed = True
+        else:
+            trk.fall_count = 0
+            trk.stand_count += 1
+            if trk.stand_count >= self.clear and trk.fallen:
+                trk.fallen = False
+                changed = True
+        return trk.fallen, s, changed
+
+
+# ==============================================================================
+# 3. 后台视频流处理线程 (QThread)
+# ==============================================================================
+class CameraWorker(QThread):
+    frame_ready = pyqtSignal(object, list, dict)
+    fall_event = pyqtSignal(int, bool, float)
+    error = pyqtSignal(str)
+
+    def __init__(self, model_path="yolov8n-pose.pt", resolution=(640, 480), conf=0.45, fall_thresh=0.6):
+        super().__init__()
+        self.model_path = model_path
+        self.resolution = resolution
+        self.conf = conf
+        self.fall_thresh = fall_thresh
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        """线程主循环"""
+        model = YOLO(self.model_path)
+        model.predict(np.zeros((480, 640, 3), np.uint8), verbose=False) # 预热模型
+        
+        tracker = MultiObjectTracker()
+        fall_detector = FallDetector(threshold=self.fall_thresh)
+        pipeline = None
+
+        try:
+            # 初始化相机
+            pipeline = ob.Pipeline()
+            config = ob.Config()
+            config.enable_stream(pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR).get_default_video_stream_profile())
+            config.enable_stream(pipeline.get_stream_profile_list(ob.OBSensorType.DEPTH_SENSOR).get_default_video_stream_profile())
+            pipeline.start(config)
+            mode = "camera"
+        except Exception as e:
+            self.error.emit(f"相机初始化失败: {e}")
+            if pipeline: pipeline.stop()
+            return
+
+        last_t = time.time()
+        fps_ema = 0.0
+
+        while not self._stop.is_set():
+            # 1. 获取数据
+            frames = pipeline.wait_for_frames(1000)
+            if not frames: continue
+            c_img, d_img = self._process_frames(frames)
+            if c_img is None: continue
+
+            # 缩放以降低 CPU 负载
+            if self.resolution and c_img.shape[1] > self.resolution[0]:
+                scale = self.resolution[0] / c_img.shape[1]
+                new_h = int(c_img.shape[0] * scale)
+                c_img = cv2.resize(c_img, (self.resolution[0], new_h), interpolation=cv2.INTER_AREA)
+                if d_img is not None:
+                    d_img = cv2.resize(d_img, (self.resolution[0], new_h), interpolation=cv2.INTER_NEAREST)
+
+            c_h, c_w = c_img.shape[:2]
+            d_h, d_w = d_img.shape[:2] if d_img is not None else (c_h, c_w)
+
+            # 2. 推理与追踪
+            track_list = self._infer_and_track(model, tracker, fall_detector, c_img, d_img, c_w, c_h, d_w, d_h)
+
+            # 3. 绘制画面
+            viz = self._draw(c_img.copy(), track_list)
+
+            # 4. 统计与信号发送
+            now = time.time()
+            fps = 1.0 / (now - last_t) if (now - last_t) > 0 else 0.0
+            fps_ema = fps if fps_ema == 0 else 0.9 * fps_ema + 0.1 * fps
+            last_t = now
+
+            stats = {"fps": round(fps_ema, 1), "count": len(track_list), "mode": mode, 
+                     "alarms": sum(1 for t in track_list if t["fallen"])}
+            self.frame_ready.emit(cv2.cvtColor(viz, cv2.COLOR_BGR2RGB), track_list, stats)
+
+        pipeline.stop()
+
+    def _process_frames(self, frames):
+        """将原始数据帧转为 OpenCV 格式"""
+        color_frame = frames.get_color_frame()
+        depth_frame = frames.get_depth_frame()
+        if not color_frame or not depth_frame: return None, None
+
+        # 解析彩色图
+        c_data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+        fmt = color_frame.get_format()
+        if fmt == ob.OBFormat.MJPG:
+            c_img = cv2.imdecode(c_data, cv2.IMREAD_COLOR)
+        elif fmt == ob.OBFormat.RGB:
+            c_img = cv2.cvtColor(c_data.reshape((color_frame.get_height(), color_frame.get_width(), 3)), cv2.COLOR_RGB2BGR)
+        elif fmt == ob.OBFormat.YUYV:
+            c_img = cv2.cvtColor(c_data.reshape((color_frame.get_height(), color_frame.get_width(), 2)), cv2.COLOR_YUV2BGR_YUY2)
+        else:
+            return None, None
+
+        # 解析深度图，并转为真实毫米
+        d_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+        d_img = d_data.reshape((depth_frame.get_height(), depth_frame.get_width())).astype(np.float32) * depth_frame.get_depth_scale()
+        return c_img, d_img
+
+    def _infer_and_track(self, model, tracker, fall_detector, c_img, d_img, c_w, c_h, d_w, d_h):
+        """执行 YOLO 推理、目标追踪、跌倒和距离计算"""
+        results = model.predict(c_img, conf=self.conf, verbose=False)[0]
+        detections = []
+        
+        if results.boxes is not None and len(results.boxes):
+            xyxy = results.boxes.xyxy.cpu().numpy()
+            confs = results.boxes.conf.cpu().numpy()
+            kps_all = results.keypoints
+            kps = np.concatenate([kps_all.xy.cpu().numpy(), kps_all.conf.cpu().numpy()[..., None]], axis=-1) if (kps_all is not None and kps_all.xy is not None and len(kps_all.xy)) else None
+            for i, box in enumerate(xyxy):
+                detections.append((box, float(confs[i]), kps[i] if kps is not None and i < len(kps) else None))
+
+        tracker.mark_lost()
+        tracks = tracker.update(detections)
+        track_list = []
+
+        for tid in sorted(tracks):
+            trk = tracks[tid]
+            box = trk.box
+            cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
+            cx_d = int(np.clip(cx * d_w / c_w, 0, d_w - 1))
+            cy_d = int(np.clip(cy * d_h / c_h, 0, d_h - 1))
+
+            # 读取深度取中位数防抖
+            dist_m = None
+            if d_img is not None:
+                patch = d_img[max(0, cy_d - 2):min(d_h, cy_d + 3), max(0, cx_d - 2):min(d_w, cx_d + 3)]
+                vals = patch[patch > 0]
+                if len(vals): dist_m = float(np.median(vals)) / 1000.0
+
+            if dist_m is not None:
+                trk.dist_history.append(dist_m)
+                trk.smooth_dist = float(np.mean(trk.dist_history))
+            else:
+                trk.smooth_dist = None
+
+            # 跌倒判定
+            fallen, score = False, 0.0
+            if trk.keypoints is not None:
+                fallen, score, changed = fall_detector.update(trk, box, trk.keypoints)
+                if changed: self.fall_event.emit(tid, fallen, score)
+
+            track_list.append({
+                "id": tid, "box": [int(v) for v in box], "dist": trk.smooth_dist,
+                "fallen": fallen, "score": score, "conf": trk.conf, "kps": trk.keypoints
+            })
+            
+        return track_list
+
+    def _draw(self, img, track_list):
+        """在画面上绘制边框、文字和骨架"""
+        for t in track_list:
+            x1, y1, x2, y2 = t["box"]
+            color = (0, 0, 255) if t["fallen"] else ((0, 165, 255) if t["score"] >= 0.45 else (0, 255, 0))
+            status = "FALL" if t["fallen"] else ("risk" if t["score"] >= 0.45 else "stand")
+            
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            dist_str = f"{t['dist']:.2f}m" if t["dist"] is not None else "?m"
+            cv2.putText(img, f"ID{t['id']} {status} {dist_str}", (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+            if t["kps"] is not None:
+                kps = t["kps"]
+                for a, b in SKELETON:
+                    if kps[a][2] > 0.3 and kps[b][2] > 0.3:
+                        cv2.line(img, (int(kps[a][0]), int(kps[a][1])), (int(kps[b][0]), int(kps[b][1])), (255, 200, 0), 2)
+                for p in kps:
+                    if p[2] > 0.3:
+                        cv2.circle(img, (int(p[0]), int(p[1])), 3, (255, 0, 255), -1)
+        return img
+
+
+# ==============================================================================
+# 4. PyQt5 前端 UI 模块
+# ==============================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("3D Smart Guard - 多目标追踪 + 防跌倒")
+        self.resize(1180, 720)
+        self.tracks_snapshot = []
+        self._fall_flash = False
+
+        self._init_ui()
+        self._init_timers()
+
+        self.worker = None
+        self.start_btn.clicked.connect(self.start)
+        self.stop_btn.clicked.connect(self.stop)
+        self._log("就绪。点击「启动」开始。")
+
+    def _init_ui(self):
+        """初始化页面布局"""
+        # 1. 视频区
+        self.video_label = QLabel("等待视频流...")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setStyleSheet("background:#111; color:#aaa; border:1px solid #333;")
+        
+        self.alarm_banner = QLabel("")
+        self.alarm_banner.setAlignment(Qt.AlignCenter)
+        self.alarm_banner.setStyleSheet(f"font-size:20px; font-weight:bold; padding:8px; color:#333; background:#444;")
+
+        # 2. 数据表格区
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["ID", "状态", "距离", "跌倒分", "置信度"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("font-family: Consolas, 'Microsoft YaHei';")
+
+        # 3. 状态信息
+        self.fps_label = QLabel("FPS: --")
+        self.count_label = QLabel("人数: 0")
+        self.mode_label = QLabel("模式: --")
+        
+        # 4. 参数配置区
+        self.conf_spin = QDoubleSpinBox()
+        self.conf_spin.setRange(0.05, 0.95); self.conf_spin.setValue(0.45); self.conf_spin.setSingleStep(0.05)
+        self.fall_spin = QDoubleSpinBox()
+        self.fall_spin.setRange(0.3, 0.95); self.fall_spin.setValue(0.6); self.fall_spin.setSingleStep(0.05)
+        self.res_spin = QSpinBox()
+        self.res_spin.setRange(320, 1280); self.res_spin.setValue(640); self.res_spin.setSingleStep(80)
+        
+        self.start_btn = QPushButton("启动")
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setEnabled(False)
+
+        params_group = QGroupBox("参数设置 (重启后生效)")
+        pg = QGridLayout()
+        pg.addWidget(QLabel("分辨率宽"), 0, 0); pg.addWidget(self.res_spin, 0, 1)
+        pg.addWidget(QLabel("置信度"), 0, 2); pg.addWidget(self.conf_spin, 0, 3)
+        pg.addWidget(QLabel("跌倒阈值"), 1, 0); pg.addWidget(self.fall_spin, 1, 1)
+        pg.addWidget(self.start_btn, 1, 2); pg.addWidget(self.stop_btn, 1, 3)
+        params_group.setLayout(pg)
+
+        # 5. 组装布局
+        info_layout = QHBoxLayout()
+        info_layout.addWidget(self.fps_label)
+        info_layout.addWidget(self.count_label)
+        info_layout.addWidget(self.mode_label)
+        info_layout.addStretch(1)
+
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self.alarm_banner)
+        left_panel.addWidget(self.video_label, 1)
+        left_panel.addLayout(info_layout)
+
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(QLabel("实时人员列表"))
+        right_panel.addWidget(self.table)
+        right_panel.addWidget(QLabel("事件日志"))
+        right_panel.addWidget(self.log, 1)
+        right_panel.addWidget(params_group)
+
+        splitter = QSplitter(Qt.Horizontal)
+        lw, rw = QWidget(), QWidget()
+        lw.setLayout(left_panel); rw.setLayout(right_panel)
+        splitter.addWidget(lw); splitter.addWidget(rw)
+        splitter.setSizes([760, 400])
+        self.setCentralWidget(splitter)
+
+    def _init_timers(self):
+        """初始化刷新定时器"""
+        self._flash_timer = QTimer(self)
+        self._flash_timer.timeout.connect(self._flash_alarm)
+        self._table_timer = QTimer(self)
+        self._table_timer.timeout.connect(self._refresh_table)
+        self._table_timer.start(400)  # 表格每 400ms 刷新一次，防止频繁重绘卡顿
+
+    def start(self):
+        if self.worker and self.worker.isRunning(): return
+        
+        w = int(self.res_spin.value())
+        model_path = str(SCRIPT_DIR / "yolov8n-pose.pt")
+        if not Path(model_path).is_file(): model_path = "yolov8n-pose.pt"
+
+        self.worker = CameraWorker(
+            model_path=model_path, resolution=(w, int(w * 3 / 4)),
+            conf=float(self.conf_spin.value()), fall_thresh=float(self.fall_spin.value())
+        )
+        self.worker.frame_ready.connect(self._on_frame)
+        self.worker.fall_event.connect(self._on_fall)
+        self.worker.error.connect(self._log)
+        self.worker.start()
+        
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._log("已启动 ...")
+
+    def stop(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait(3000)
+            self.worker = None
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._log("已停止。")
+
+    def _on_frame(self, rgb, track_list, stats):
+        """接收视频流并渲染"""
+        if rgb.shape[1] > 960:
+            scale = 960 / rgb.shape[1]
+            rgb = cv2.resize(rgb, (960, int(rgb.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+            
+        img = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format_RGB888).copy()
+        self.video_label.setPixmap(QPixmap.fromImage(img))
+        self.tracks_snapshot = track_list
+        
+        self.fps_label.setText(f"FPS: {stats['fps']}")
+        self.count_label.setText(f"人数: {stats['count']}")
+        self.mode_label.setText(f"模式: {'相机' if stats['mode'] == 'camera' else '回放'}")
+        
+        alarms = stats.get("alarms", 0)
+        if alarms:
+            self.alarm_banner.setText(f"⚠ 跌倒告警! 当前 {alarms} 人疑似跌倒")
+            self.alarm_banner.setStyleSheet(f"font-size:20px; font-weight:bold; padding:8px; color:#fff; background:{COLOR_ALARM};")
+            if not self._fall_flash:
+                self._fall_flash = True
+                self._flash_timer.start(600)
+        else:
+            self.alarm_banner.setText("监控中 · 未发现跌倒")
+            self.alarm_banner.setStyleSheet(f"font-size:20px; font-weight:bold; padding:8px; color:#e6ffe6; background:{COLOR_SAFE};")
+            self._fall_flash = False
+            self._flash_timer.stop()
+
+    def _refresh_table(self):
+        rows = self.tracks_snapshot
+        if len(rows) != self.table.rowCount():
+            self.table.setRowCount(len(rows))
+            
+        for i, t in enumerate(rows):
+            status = "跌倒!" if t["fallen"] else ("疑似" if t["score"] >= 0.45 else "站立")
+            dist = f"{t['dist']:.2f}m" if t["dist"] is not None else "--"
+            vals = [str(t["id"]), status, dist, f"{t['score']:.2f}", f"{t['conf']:.2f}"]
+            
+            for j, v in enumerate(vals):
+                item = self.table.item(i, j)
+                if item is None:
+                    item = QTableWidgetItem(v)
+                    self.table.setItem(i, j, item)
+                else:
+                    item.setText(v)
+                if j == 1:
+                    color = COLOR_ALARM if t["fallen"] else (COLOR_WARN if t["score"] >= 0.45 else COLOR_SAFE)
+                    item.setForeground(QColor(color))
+
+    def _on_fall(self, tid, fallen, score):
+        if fallen:
+            self._log(f"🚨 ID {tid} 检测到跌倒! (得分 {score:.2f})")
+            QApplication.beep()
+        else:
+            self._log(f"✅ ID {tid} 恢复站立 (得分 {score:.2f})")
+
+    def _flash_alarm(self):
+        self._fall_flash = not self._fall_flash
+        color = "#b71c1c" if self._fall_flash else COLOR_ALARM
+        self.alarm_banner.setStyleSheet(f"font-size:20px; font-weight:bold; padding:8px; color:#fff; background:{color};")
+
+    def _log(self, text):
+        t = time.strftime("%H:%M:%S")
+        self.log.append(f"[{t}] {text}")
+        lines = self.log.toPlainText().splitlines()
+        if len(lines) > 500:
+            self.log.setPlainText("\n".join(lines[-500:]))
+
+    def closeEvent(self, ev):
+        self.stop()
+        ev.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    
+    # 环境依赖检查
+    problems = []
+    if YOLO is None: problems.append(f"ultralytics 导入失败: {YOLO_ERROR}")
+    if ob is None: problems.append(f"pyorbbecsdk 导入失败: {OB_ERROR}")
+    
+    if problems:
+        msg = ("缺少运行依赖, 请使用正确的 Python 环境启动:\n\n"
+               f"当前解释器: {sys.executable}\n\n"
+               "--- 详细错误 ---\n" + "\n".join(problems))
+        QMessageBox.critical(None, "启动失败: 缺少依赖", msg)
+        sys.exit(1)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
